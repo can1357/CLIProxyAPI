@@ -309,6 +309,13 @@ func TestModelSchedulerProbeAndAvailability(t *testing.T) {
 		t.Fatalf("predicate-excluding-a should yield b, got %v", picked)
 	}
 
+	if picked = shard.pickProbeLocked(nil, now); picked != nil {
+		t.Fatalf("expected probes to be rate-limited after both blocked auths were probed, got %q", picked.ID)
+	}
+	if picked = shard.pickProbeLocked(nil, now.Add(allBlockedProbeWindow+time.Second)); picked == nil || picked.ID != "a" {
+		t.Fatalf("expected probe window expiry to allow oldest auth again, got %v", picked)
+	}
+
 	// If nothing is aged past the window, no probe is offered.
 	freshAuth := &Auth{ID: "c", Provider: "codex", ModelStates: map[string]*ModelState{"m": {
 		Status: StatusError, Unavailable: true,

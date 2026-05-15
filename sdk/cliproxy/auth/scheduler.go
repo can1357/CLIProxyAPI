@@ -74,7 +74,8 @@ type scheduledAuth struct {
 	// blockedAt mirrors ModelState.BlockedSince so the picker can decide
 	// whether enough time has elapsed to probe a blocked auth when no
 	// ready candidates remain.
-	blockedAt time.Time
+	blockedAt   time.Time
+	lastProbeAt time.Time
 }
 
 // readyBucket keeps the ready views for one priority level.
@@ -457,9 +458,8 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 // non-ready state. Returns nil when nothing qualifies.
 func (s *authScheduler) mixedProbeLocked(providers []string, modelKey string, predicate func(*scheduledAuth) bool, now time.Time) (*Auth, string) {
 	threshold := now.Add(-allBlockedProbeWindow)
-	var pickedAuth *Auth
+	var pickedEntry *scheduledAuth
 	var pickedProvider string
-	var pickedAt time.Time
 	for _, providerKey := range providers {
 		providerState := s.providers[providerKey]
 		if providerState == nil {
@@ -481,17 +481,23 @@ func (s *authScheduler) mixedProbeLocked(providers []string, modelKey string, pr
 			if entry.blockedAt.IsZero() || entry.blockedAt.After(threshold) {
 				continue
 			}
+			if !entry.lastProbeAt.IsZero() && entry.lastProbeAt.After(threshold) {
+				continue
+			}
 			if predicate != nil && !predicate(entry) {
 				continue
 			}
-			if pickedAuth == nil || entry.blockedAt.Before(pickedAt) {
-				pickedAuth = entry.auth.Clone()
+			if pickedEntry == nil || entry.blockedAt.Before(pickedEntry.blockedAt) {
+				pickedEntry = entry
 				pickedProvider = providerKey
-				pickedAt = entry.blockedAt
 			}
 		}
 	}
-	return pickedAuth, pickedProvider
+	if pickedEntry == nil || pickedEntry.auth == nil {
+		return nil, ""
+	}
+	pickedEntry.lastProbeAt = now
+	return pickedEntry.auth.Clone(), pickedProvider
 }
 
 // mixedUnavailableErrorLocked synthesizes the mixed-provider cooldown or unavailable error.
@@ -793,6 +799,9 @@ func (m *modelScheduler) upsertEntryLocked(meta *scheduledAuthMeta, now time.Tim
 		entry.nextRetryAt = next
 		entry.blockedAt = modelBlockedSince(meta.auth, m.modelKey, now)
 	}
+	if !previousBlockedAt.Equal(entry.blockedAt) {
+		entry.lastProbeAt = time.Time{}
+	}
 
 	if ok && previousState == entry.state && previousNextRetryAt.Equal(entry.nextRetryAt) && previousBlockedAt.Equal(entry.blockedAt) && previousPriority == meta.priority && previousParent == meta.virtualParent && previousWebsocketEnabled == meta.websocketEnabled {
 		return
@@ -831,6 +840,7 @@ func (m *modelScheduler) promoteExpiredLocked(now time.Time) {
 			entry.state = scheduledStateReady
 			entry.nextRetryAt = time.Time{}
 			entry.blockedAt = time.Time{}
+			entry.lastProbeAt = time.Time{}
 		case reason == blockReasonCooldown:
 			entry.state = scheduledStateCooldown
 			entry.nextRetryAt = next
@@ -839,6 +849,7 @@ func (m *modelScheduler) promoteExpiredLocked(now time.Time) {
 			entry.state = scheduledStateDisabled
 			entry.nextRetryAt = time.Time{}
 			entry.blockedAt = time.Time{}
+			entry.lastProbeAt = time.Time{}
 		default:
 			entry.state = scheduledStateBlocked
 			entry.nextRetryAt = next
@@ -1015,6 +1026,9 @@ func (m *modelScheduler) pickProbeLocked(predicate func(*scheduledAuth) bool, no
 		if entry.blockedAt.IsZero() || entry.blockedAt.After(threshold) {
 			continue
 		}
+		if !entry.lastProbeAt.IsZero() && entry.lastProbeAt.After(threshold) {
+			continue
+		}
 		if predicate != nil && !predicate(entry) {
 			continue
 		}
@@ -1025,6 +1039,7 @@ func (m *modelScheduler) pickProbeLocked(predicate func(*scheduledAuth) bool, no
 	if picked == nil || picked.auth == nil {
 		return nil
 	}
+	picked.lastProbeAt = now
 	return picked.auth.Clone()
 }
 
