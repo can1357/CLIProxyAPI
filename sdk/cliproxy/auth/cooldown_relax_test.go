@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 )
 
 // TestNextTransientCooldown verifies the 5xx exponential ladder starts short

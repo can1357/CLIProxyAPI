@@ -953,9 +953,46 @@ func TestClaudeExecutor_ExecuteOpenAINonStreamRejectsClaudeErrorEvent(t *testing
 	if err == nil {
 		t.Fatal("Execute error = nil, want upstream error event")
 	}
-	assertStatusErr(t, err, http.StatusBadGateway)
+	assertStatusErr(t, err, httpStatusAnthropicOverloaded)
 	if !strings.Contains(err.Error(), "upstream overloaded") {
 		t.Fatalf("Execute error = %q, want upstream overloaded", err.Error())
+	}
+}
+
+func TestClaudeExecutor_ExecuteStreamReturnsOverloadedEventAsError(t *testing.T) {
+	body := `data: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}` + "\n"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(body))
+	}))
+	defer server.Close()
+
+	executor := NewClaudeExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"api_key":  "key-123",
+		"base_url": server.URL,
+	}}
+	payload := []byte(`{"model":"claude-3-5-sonnet-20241022","messages":[{"role":"user","content":"hi"}],"stream":true}`)
+	result, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "claude-3-5-sonnet-20241022",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("claude"),
+		Stream:       true,
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStream error = %v", err)
+	}
+	chunk, ok := <-result.Chunks
+	if !ok {
+		t.Fatal("stream closed without overloaded error chunk")
+	}
+	if chunk.Err == nil {
+		t.Fatalf("first chunk error = nil, payload=%q", string(chunk.Payload))
+	}
+	assertStatusErr(t, chunk.Err, httpStatusAnthropicOverloaded)
+	if !strings.Contains(chunk.Err.Error(), "overloaded_error") {
+		t.Fatalf("chunk error = %q, want overloaded_error", chunk.Err.Error())
 	}
 }
 

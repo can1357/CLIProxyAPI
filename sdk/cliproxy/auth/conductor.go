@@ -2175,7 +2175,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	suspendReason := ""
 	clearModelQuota := false
 	setModelQuota := false
-	clearAffinityOnly := !result.Success && isClaudeOutOfExtraUsageResultError(result.Error)
+	clearAffinityOnly := !result.Success && isClaudeSessionScopedResultError(result)
 	var authSnapshot *Auth
 
 	m.mu.Lock()
@@ -2688,6 +2688,31 @@ func isClaudeOutOfExtraUsageResultError(err *Error) bool {
 		return false
 	}
 	return isClaudeOutOfExtraUsageMessage(err.Message)
+}
+
+func isClaudeOverloadedMessage(message string) bool {
+	lower := strings.ToLower(strings.TrimSpace(message))
+	if lower == "" {
+		return false
+	}
+	return strings.Contains(lower, "overloaded_error") ||
+		lower == "overloaded" ||
+		strings.Contains(lower, "upstream returned error event: overloaded")
+}
+
+func isClaudeOverloadedResultError(err *Error) bool {
+	if err == nil {
+		return false
+	}
+	return isClaudeOverloadedMessage(err.Message)
+}
+
+func isClaudeSessionScopedResultError(result Result) bool {
+	if !strings.EqualFold(strings.TrimSpace(result.Provider), "claude") {
+		return false
+	}
+	return isClaudeOutOfExtraUsageResultError(result.Error) ||
+		isClaudeOverloadedResultError(result.Error)
 }
 
 // isRequestInvalidError returns true if the error represents a client request

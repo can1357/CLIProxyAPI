@@ -80,6 +80,7 @@ var oauthToolsToRemove = map[string]bool{}
 // Anthropic-compatible upstreams may reject or even crash when Claude models
 // omit max_tokens. Prefer registered model metadata before using a fallback.
 const defaultModelMaxTokens = 1024
+const httpStatusAnthropicOverloaded = 529
 
 func NewClaudeExecutor(cfg *config.Config) *ClaudeExecutor { return &ClaudeExecutor{cfg: cfg} }
 
@@ -456,6 +457,15 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			for scanner.Scan() {
 				line := scanner.Bytes()
 				helps.AppendAPIResponseChunk(ctx, e.cfg, line)
+				if errEvent, ok := claudeOverloadedStreamError(line); ok {
+					helps.RecordAPIResponseError(ctx, e.cfg, errEvent)
+					reporter.PublishFailure(ctx, errEvent)
+					select {
+					case out <- cliproxyexecutor.StreamChunk{Err: errEvent}:
+					case <-ctx.Done():
+					}
+					return
+				}
 				if detail, ok := helps.ParseClaudeStreamUsage(line); ok {
 					reporter.Publish(ctx, detail)
 				}
@@ -488,6 +498,15 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		for scanner.Scan() {
 			line := scanner.Bytes()
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
+			if errEvent, ok := claudeOverloadedStreamError(line); ok {
+				helps.RecordAPIResponseError(ctx, e.cfg, errEvent)
+				reporter.PublishFailure(ctx, errEvent)
+				select {
+				case out <- cliproxyexecutor.StreamChunk{Err: errEvent}:
+				case <-ctx.Done():
+				}
+				return
+			}
 			if detail, ok := helps.ParseClaudeStreamUsage(line); ok {
 				reporter.Publish(ctx, detail)
 			}
@@ -547,14 +566,9 @@ func validateClaudeStreamingResponse(data []byte) error {
 		root := gjson.ParseBytes(payload)
 		switch root.Get("type").String() {
 		case "error":
+			errorType := strings.TrimSpace(root.Get("error.type").String())
 			message := strings.TrimSpace(root.Get("error.message").String())
-			if message == "" {
-				message = strings.TrimSpace(root.Get("error.type").String())
-			}
-			if message == "" {
-				message = "unknown upstream error"
-			}
-			return statusErr{code: http.StatusBadGateway, msg: "claude executor: upstream returned error event: " + message}
+			return claudeStreamErrorStatus(errorType, message)
 		case "message_start":
 			message := root.Get("message")
 			if strings.TrimSpace(message.Get("id").String()) == "" || strings.TrimSpace(message.Get("model").String()) == "" {
@@ -578,6 +592,54 @@ func validateClaudeStreamingResponse(data []byte) error {
 		return statusErr{code: http.StatusBadGateway, msg: "claude executor: upstream stream response ended before message completion"}
 	}
 	return nil
+}
+
+func claudeOverloadedStreamError(line []byte) (statusErr, bool) {
+	payload := bytes.TrimSpace(line)
+	if len(payload) == 0 || !bytes.HasPrefix(payload, []byte("data:")) {
+		return statusErr{}, false
+	}
+	payload = bytes.TrimSpace(payload[len("data:"):])
+	if len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) || !gjson.ValidBytes(payload) {
+		return statusErr{}, false
+	}
+	root := gjson.ParseBytes(payload)
+	if root.Get("type").String() != "error" {
+		return statusErr{}, false
+	}
+	errorType := strings.TrimSpace(root.Get("error.type").String())
+	message := strings.TrimSpace(root.Get("error.message").String())
+	if !isClaudeOverloadedErrorEvent(errorType, message) {
+		return statusErr{}, false
+	}
+	return claudeStreamErrorStatus(errorType, message), true
+}
+
+func claudeStreamErrorStatus(errorType, message string) statusErr {
+	message = strings.TrimSpace(message)
+	errorType = strings.TrimSpace(errorType)
+	display := message
+	if display == "" {
+		display = errorType
+	}
+	if display == "" {
+		display = "unknown upstream error"
+	}
+	if errorType != "" && message != "" {
+		display = errorType + ": " + message
+	}
+	status := http.StatusBadGateway
+	if isClaudeOverloadedErrorEvent(errorType, message) {
+		status = httpStatusAnthropicOverloaded
+	}
+	return statusErr{code: status, msg: "claude executor: upstream returned error event: " + display}
+}
+
+func isClaudeOverloadedErrorEvent(errorType, message string) bool {
+	if strings.EqualFold(strings.TrimSpace(errorType), "overloaded_error") {
+		return true
+	}
+	return strings.EqualFold(strings.TrimSpace(message), "Overloaded")
 }
 
 func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
@@ -1619,7 +1681,6 @@ func checkSystemInstructionsWithMode(payload []byte, strictMode bool) []byte {
 	return checkSystemInstructionsWithSigningMode(payload, strictMode, false, false, "2.1.63", "", "")
 }
 
-
 // systemContainsClaudeAgentMarker reports whether any text block in the
 // request's system field contains the "You are a Claude agent" marker used
 // by the Claude Agent SDK. Callers that already cloak via the SDK should not
@@ -1643,6 +1704,7 @@ func systemContainsClaudeAgentMarker(system gjson.Result) bool {
 	}
 	return false
 }
+
 // checkSystemInstructionsWithSigningMode injects Claude Code-style system blocks:
 //
 //	system[0]: billing header (no cache_control)

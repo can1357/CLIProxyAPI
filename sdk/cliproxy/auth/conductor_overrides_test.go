@@ -905,3 +905,39 @@ func TestMarkResult_OutOfExtraUsageClearsAffinityWithoutPoisoningAuth(t *testing
 		t.Fatalf("expected affinity invalidation for %q, got %v", auth.ID, selector.invalidated)
 	}
 }
+
+func TestMarkResult_ClaudeOverloadedClearsAffinityWithoutPoisoningAuth(t *testing.T) {
+	selector := &extraUsageInvalidatingSelector{}
+	m := NewManager(nil, selector, nil)
+	auth := &Auth{ID: "claude-auth", Provider: "claude", Status: StatusActive}
+	if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	model := "claude-opus-4-7"
+	msg := `claude executor: upstream returned error event: overloaded_error: Overloaded`
+	m.MarkResult(context.Background(), Result{
+		AuthID:   auth.ID,
+		Provider: auth.Provider,
+		Model:    model,
+		Success:  false,
+		Error:    &Error{HTTPStatus: 529, Message: msg},
+	})
+
+	updated, ok := m.GetByID(auth.ID)
+	if !ok || updated == nil {
+		t.Fatalf("expected auth to remain registered")
+	}
+	if updated.Unavailable || updated.Status == StatusError {
+		t.Fatalf("expected auth to stay healthy, unavailable=%v status=%s", updated.Unavailable, updated.Status)
+	}
+	if updated.LastError != nil || updated.StatusMessage != "" {
+		t.Fatalf("expected no persisted auth error, last=%v status_message=%q", updated.LastError, updated.StatusMessage)
+	}
+	if state := updated.ModelStates[model]; state != nil {
+		t.Fatalf("expected no persisted model error, got %#v", state)
+	}
+	if len(selector.invalidated) != 1 || selector.invalidated[0] != auth.ID {
+		t.Fatalf("expected affinity invalidation for %q, got %v", auth.ID, selector.invalidated)
+	}
+}
