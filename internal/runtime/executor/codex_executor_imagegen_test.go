@@ -3,6 +3,7 @@ package executor
 import (
 	"testing"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/tidwall/gjson"
 )
@@ -130,5 +131,37 @@ func TestCodexImageGenerationToolModel_DefaultsWhenMissing(t *testing.T) {
 
 	if got := codexImageGenerationToolModel(body); got != codexDefaultImageToolModel {
 		t.Fatalf("expected default image model %s, got %s", codexDefaultImageToolModel, got)
+	}
+}
+
+func TestApplyCodexImageGenerationPolicy_RemovesToolForUnsupportedModel(t *testing.T) {
+	body := []byte(`{"model":"gpt-5.3-codex-spark","tools":[{"type":"function","name":"f1"},{"type":"image_generation","output_format":"png"}]}`)
+
+	result := applyCodexImageGenerationPolicy(body, "gpt-5.3-codex-spark", nil, nil)
+	tools := gjson.GetBytes(result, "tools").Array()
+	if len(tools) != 1 {
+		t.Fatalf("expected 1 tool after stripping image_generation, got %d: %s", len(tools), gjson.GetBytes(result, "tools").Raw)
+	}
+	if got := tools[0].Get("type").String(); got != "function" {
+		t.Fatalf("expected remaining function tool, got %q", got)
+	}
+}
+
+func TestApplyCodexImageGenerationPolicy_RemovesOnlyImageTool(t *testing.T) {
+	body := []byte(`{"model":"gpt-5.3","tools":[{"type":"image_generation","output_format":"png"}]}`)
+
+	result := applyCodexImageGenerationPolicy(body, "gpt-5.3", nil, nil)
+	if gjson.GetBytes(result, "tools").Exists() {
+		t.Fatalf("expected tools to be removed when only image_generation was present, got %s", gjson.GetBytes(result, "tools").Raw)
+	}
+}
+
+func TestApplyCodexImageGenerationPolicy_DoesNotInjectWhenDisabled(t *testing.T) {
+	body := []byte(`{"model":"gpt-5.4","input":"draw a cat"}`)
+	cfg := &config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll}}
+
+	result := applyCodexImageGenerationPolicy(body, "gpt-5.4", nil, cfg)
+	if gjson.GetBytes(result, "tools").Exists() {
+		t.Fatalf("expected no injected tools when image generation is disabled, got %s", gjson.GetBytes(result, "tools").Raw)
 	}
 }
